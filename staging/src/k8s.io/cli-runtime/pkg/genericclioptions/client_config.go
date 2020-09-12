@@ -37,9 +37,13 @@ var _ = clientcmd.ClientConfig(&clientConfig{})
 
 type clientConfig struct {
 	defaultClientConfig clientcmd.ClientConfig
+	local               bool
 }
 
 func (c *clientConfig) RawConfig() (clientcmdapi.Config, error) {
+	if c.local {
+		return clientcmdapi.Config{}, nil
+	}
 	config, err := c.defaultClientConfig.RawConfig()
 	// replace client-go's ErrEmptyConfig error with our custom, more verbose version
 	if clientcmd.IsEmptyConfig(err) {
@@ -49,6 +53,9 @@ func (c *clientConfig) RawConfig() (clientcmdapi.Config, error) {
 }
 
 func (c *clientConfig) ClientConfig() (*restclient.Config, error) {
+	if c.local {
+		return &restclient.Config{}, nil
+	}
 	config, err := c.defaultClientConfig.ClientConfig()
 	// replace client-go's ErrEmptyConfig error with our custom, more verbose version
 	if clientcmd.IsEmptyConfig(err) {
@@ -59,6 +66,9 @@ func (c *clientConfig) ClientConfig() (*restclient.Config, error) {
 
 func (c *clientConfig) Namespace() (string, bool, error) {
 	namespace, ok, err := c.defaultClientConfig.Namespace()
+	if c.local {
+		return namespace, ok, nil
+	}
 	// replace client-go's ErrEmptyConfig error with our custom, more verbose version
 	if clientcmd.IsEmptyConfig(err) {
 		return namespace, ok, ErrEmptyConfig
