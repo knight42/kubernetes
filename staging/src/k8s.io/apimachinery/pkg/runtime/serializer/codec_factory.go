@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"k8s.io/apimachinery/pkg/runtime/serializer/recognizer"
+	"k8s.io/apimachinery/pkg/runtime/serializer/unmanaged"
 	"k8s.io/apimachinery/pkg/runtime/serializer/versioning"
 )
 
@@ -53,6 +54,8 @@ func newSerializersForScheme(scheme *runtime.Scheme, mf json.MetaFactory, option
 		mf, scheme, scheme,
 		json.SerializerOptions{Yaml: false, Pretty: false, Strict: options.Strict},
 	)
+	jsonUnmanagedSerializer := unmanaged.NewSerializer(jsonSerializer)
+
 	jsonSerializerType := serializerType{
 		AcceptContentTypes: []string{runtime.ContentTypeJSON},
 		ContentType:        runtime.ContentTypeJSON,
@@ -74,11 +77,26 @@ func newSerializersForScheme(scheme *runtime.Scheme, mf json.MetaFactory, option
 		mf, scheme, scheme,
 		json.SerializerOptions{Yaml: true, Pretty: false, Strict: options.Strict},
 	)
+	yamlUnmanagedSerializer := unmanaged.NewSerializer(yamlSerializer)
 	protoSerializer := protobuf.NewSerializer(scheme, scheme)
+	protoUnmanagedSerializer := unmanaged.NewSerializer(protoSerializer)
 	protoRawSerializer := protobuf.NewRawSerializer(scheme, scheme)
+	protoUnmanagedRawSerializer := unmanaged.NewSerializer(protoRawSerializer)
 
 	serializers := []serializerType{
 		jsonSerializerType,
+		{
+			AcceptContentTypes: []string{runtime.ContentTypeUnmanagedJSON},
+			ContentType:        runtime.ContentTypeUnmanagedJSON,
+			FileExtensions:     []string{"json"},
+			EncodesAsText:      true,
+			Serializer:         jsonUnmanagedSerializer,
+			PrettySerializer:   unmanaged.NewSerializer(jsonSerializerType.PrettySerializer),
+
+			Framer:           json.Framer,
+			StreamSerializer: jsonUnmanagedSerializer,
+		},
+
 		{
 			AcceptContentTypes: []string{runtime.ContentTypeYAML},
 			ContentType:        runtime.ContentTypeYAML,
@@ -87,6 +105,14 @@ func newSerializersForScheme(scheme *runtime.Scheme, mf json.MetaFactory, option
 			Serializer:         yamlSerializer,
 		},
 		{
+			AcceptContentTypes: []string{runtime.ContentTypeUnmanagedYAML},
+			ContentType:        runtime.ContentTypeUnmanagedYAML,
+			FileExtensions:     []string{"yaml"},
+			EncodesAsText:      true,
+			Serializer:         yamlUnmanagedSerializer,
+		},
+
+		{
 			AcceptContentTypes: []string{runtime.ContentTypeProtobuf},
 			ContentType:        runtime.ContentTypeProtobuf,
 			FileExtensions:     []string{"pb"},
@@ -94,6 +120,15 @@ func newSerializersForScheme(scheme *runtime.Scheme, mf json.MetaFactory, option
 
 			Framer:           protobuf.LengthDelimitedFramer,
 			StreamSerializer: protoRawSerializer,
+		},
+		{
+			AcceptContentTypes: []string{runtime.ContentTypeUnmanagedProtobuf},
+			ContentType:        runtime.ContentTypeUnmanagedProtobuf,
+			FileExtensions:     []string{"pb"},
+			Serializer:         protoUnmanagedSerializer,
+
+			Framer:           protobuf.LengthDelimitedFramer,
+			StreamSerializer: protoUnmanagedRawSerializer,
 		},
 	}
 
