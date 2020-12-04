@@ -25,6 +25,17 @@ func (s *serializer) Encode(obj runtime.Object, w io.Writer) error {
 		obj = obj.DeepCopyObject()
 		a, _ := meta.Accessor(obj)
 		a.SetManagedFields(nil)
+	} else if meta.IsListType(obj) && meta.LenList(obj) > 0 {
+		obj = obj.DeepCopyObject()
+		_ = meta.EachListItem(obj, func(item runtime.Object) error {
+			a, err := meta.Accessor(item)
+			if err != nil {
+				// ignore
+				return nil
+			}
+			a.SetManagedFields(nil)
+			return nil
+		})
 	}
 	return s.inner.Encode(obj, w)
 }
