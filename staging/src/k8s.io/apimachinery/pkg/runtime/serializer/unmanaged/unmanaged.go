@@ -5,7 +5,7 @@ import (
 	"io"
 	"sync"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -21,9 +21,10 @@ type serializer struct {
 }
 
 func (s *serializer) Encode(obj runtime.Object, w io.Writer) error {
-	if metaObj, ok := obj.(metav1.Object); ok {
-		// TODO: should we copy the object?
-		metaObj.SetManagedFields(nil)
+	if _, err := meta.Accessor(obj); err == nil {
+		obj = obj.DeepCopyObject()
+		a, _ := meta.Accessor(obj)
+		a.SetManagedFields(nil)
 	}
 	return s.inner.Encode(obj, w)
 }
