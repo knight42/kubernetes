@@ -34,6 +34,23 @@ import (
 	utiltrace "k8s.io/utils/trace"
 )
 
+func omitManagedFields(obj runtime.Object) {
+	if _, err := meta.Accessor(obj); err == nil {
+		a, _ := meta.Accessor(obj)
+		a.SetManagedFields(nil)
+	} else if meta.IsListType(obj) {
+		_ = meta.EachListItem(obj, func(item runtime.Object) error {
+			a, err := meta.Accessor(item)
+			if err != nil {
+				// not implement `metav1.Object`, ignore
+				return nil
+			}
+			a.SetManagedFields(nil)
+			return nil
+		})
+	}
+}
+
 // transformObject takes the object as returned by storage and ensures it is in
 // the client's desired form, as well as ensuring any API level fields like self-link
 // are properly set.
@@ -63,6 +80,9 @@ func doTransformObject(ctx context.Context, obj runtime.Object, opts interface{}
 		return nil, err
 	}
 
+	if mediaType.ManagedFields == "none" {
+		omitManagedFields(obj)
+	}
 	switch target := mediaType.Convert; {
 	case target == nil:
 		return obj, nil

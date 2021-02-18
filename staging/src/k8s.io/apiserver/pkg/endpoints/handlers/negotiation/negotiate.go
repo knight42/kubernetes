@@ -162,6 +162,10 @@ type MediaTypeOptions struct {
 	// has set
 	Export bool
 
+	// managedFields represents whether clients wants to omit or request specific version of managed fields of objects.
+	// The available values are "none" or a specific version, such as "v1" or "v2".
+	ManagedFields string
+
 	// unrecognized is a list of all unrecognized keys
 	Unrecognized []string
 
@@ -220,6 +224,10 @@ func acceptMediaTypeOptions(params map[string]string, accepts *runtime.Serialize
 		// if specified, the pretty serializer will be used
 		case "pretty":
 			options.Pretty = v == "1"
+
+		// controls the presence or version of managed fields
+		case "mf":
+			options.ManagedFields = v
 
 		default:
 			options.Unrecognized = append(options.Unrecognized, k)
