@@ -733,6 +733,12 @@ const (
 	// Enables kubelet support to size memory backed volumes
 	SizeMemoryBackedVolumes featuregate.Feature = "SizeMemoryBackedVolumes"
 
+	// owner: @knight42
+	// alpha: v1.25
+	//
+	// Enables only stdout or stderr of the container to be retrievd
+	SplitStdoutAndStderr featuregate.Feature = "SplitStdoutAndStderr"
+
 	// owner: @mattcary
 	// alpha: v1.22
 	//
@@ -1005,6 +1011,8 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	ServiceLoadBalancerClass: {Default: true, PreRelease: featuregate.GA, LockToDefault: true}, // remove in 1.26
 
 	SizeMemoryBackedVolumes: {Default: true, PreRelease: featuregate.Beta},
+
+	SplitStdoutAndStderr: {Default: false, PreRelease: featuregate.Alpha},
 
 	StatefulSetAutoDeletePVC: {Default: false, PreRelease: featuregate.Alpha},
 
