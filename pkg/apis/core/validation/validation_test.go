@@ -39,10 +39,11 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	utilpointer "k8s.io/utils/pointer"
+
 	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/capabilities"
 	"k8s.io/kubernetes/pkg/features"
-	utilpointer "k8s.io/utils/pointer"
 )
 
 const (
@@ -682,7 +683,7 @@ func TestValidatePersistentVolumeSourceUpdate(t *testing.T) {
 		Namespace: "default",
 	}
 
-	//longSecretRef refers to the secretRefs which are validated with IsDNS1123Subdomain
+	// longSecretRef refers to the secretRefs which are validated with IsDNS1123Subdomain
 	longSecretName := "key-name.example.com"
 	longSecretRef := &core.SecretReference{
 		Name:      longSecretName,
@@ -17867,7 +17868,7 @@ func TestValidateSecurityContext(t *testing.T) {
 		}
 	}
 
-	//setup data
+	// setup data
 	allSettings := fullValidSC()
 	noCaps := fullValidSC()
 	noCaps.Capabilities = nil
@@ -17960,29 +17961,42 @@ func TestValidPodLogOptions(t *testing.T) {
 	negative := int64(-1)
 	zero := int64(0)
 	positive := int64(1)
+	stdoutStream := core.LogStreamTypeStdout
+	stderrStream := core.LogStreamTypeStderr
+	allStream := core.LogStreamTypeAll
+	invalidStream := core.LogStreamType("invalid")
 	tests := []struct {
-		opt  core.PodLogOptions
-		errs int
+		opt         core.PodLogOptions
+		errs        int
+		enableSplit bool
 	}{
-		{core.PodLogOptions{}, 0},
-		{core.PodLogOptions{Previous: true}, 0},
-		{core.PodLogOptions{Follow: true}, 0},
-		{core.PodLogOptions{TailLines: &zero}, 0},
-		{core.PodLogOptions{TailLines: &negative}, 1},
-		{core.PodLogOptions{TailLines: &positive}, 0},
-		{core.PodLogOptions{LimitBytes: &zero}, 1},
-		{core.PodLogOptions{LimitBytes: &negative}, 1},
-		{core.PodLogOptions{LimitBytes: &positive}, 0},
-		{core.PodLogOptions{SinceSeconds: &negative}, 1},
-		{core.PodLogOptions{SinceSeconds: &positive}, 0},
-		{core.PodLogOptions{SinceSeconds: &zero}, 1},
-		{core.PodLogOptions{SinceTime: &now}, 0},
+		{opt: core.PodLogOptions{}},
+		{opt: core.PodLogOptions{Previous: true}},
+		{opt: core.PodLogOptions{Follow: true}},
+		{opt: core.PodLogOptions{TailLines: &zero}},
+		{opt: core.PodLogOptions{TailLines: &negative}, errs: 1},
+		{opt: core.PodLogOptions{TailLines: &positive}},
+		{opt: core.PodLogOptions{LimitBytes: &zero}, errs: 1},
+		{opt: core.PodLogOptions{LimitBytes: &negative}, errs: 1},
+		{opt: core.PodLogOptions{LimitBytes: &positive}},
+		{opt: core.PodLogOptions{SinceSeconds: &negative}, errs: 1},
+		{opt: core.PodLogOptions{SinceSeconds: &positive}},
+		{opt: core.PodLogOptions{SinceSeconds: &zero}, errs: 1},
+		{opt: core.PodLogOptions{SinceTime: &now}},
+		{opt: core.PodLogOptions{Stream: &invalidStream}},
+		{opt: core.PodLogOptions{Stream: &stdoutStream}, enableSplit: true},
+		{opt: core.PodLogOptions{Stream: &stderrStream}, enableSplit: true},
+		{opt: core.PodLogOptions{Stream: &allStream}, enableSplit: true},
+		{opt: core.PodLogOptions{Stream: &invalidStream}, errs: 1, enableSplit: true},
 	}
 	for i, test := range tests {
-		errs := ValidatePodLogOptions(&test.opt)
-		if test.errs != len(errs) {
-			t.Errorf("%d: Unexpected errors: %v", i, errs)
-		}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SplitStdoutAndStderr, test.enableSplit)()
+			errs := ValidatePodLogOptions(&test.opt)
+			if test.errs != len(errs) {
+				t.Errorf("%d: Unexpected errors: %v", i, errs)
+			}
+		})
 	}
 }
 

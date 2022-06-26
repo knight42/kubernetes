@@ -19,11 +19,15 @@ package validation
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestValidateResourceRequirements(t *testing.T) {
@@ -203,11 +207,16 @@ func TestValidatePodLogOptions(t *testing.T) {
 		sinceSecondsGreaterThan1 = int64(10)
 		sinceSecondsLessThan1    = int64(0)
 		timestamp                = metav1.Now()
+		allStream                = v1.LogStreamTypeAll
+		stdoutStream             = v1.LogStreamTypeStdout
+		stderrStream             = v1.LogStreamTypeStderr
+		invalidStream            = v1.LogStreamType("invalid")
 	)
 
 	successCase := []struct {
 		name          string
 		podLogOptions v1.PodLogOptions
+		enableSplit   bool
 	}{
 		{
 			name:          "Empty PodLogOptions",
@@ -246,9 +255,33 @@ func TestValidatePodLogOptions(t *testing.T) {
 				SinceSeconds: &sinceSecondsGreaterThan1,
 			},
 		},
+		{
+			name:        "PodLogOptions with Stream stdout",
+			enableSplit: true,
+			podLogOptions: v1.PodLogOptions{
+				Stream: &stdoutStream,
+			},
+		},
+		{
+			name:        "PodLogOptions with Stream stderr with TailLines",
+			enableSplit: true,
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stderrStream,
+				TailLines: &positiveLine,
+			},
+		},
+		{
+			name:        "PodLogOptions with Stream all with SinceSeconds",
+			enableSplit: true,
+			podLogOptions: v1.PodLogOptions{
+				Stream:       &allStream,
+				SinceSeconds: &sinceSecondsGreaterThan1,
+			},
+		},
 	}
 	for _, tc := range successCase {
 		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SplitStdoutAndStderr, tc.enableSplit)()
 			if errs := ValidatePodLogOptions(&tc.podLogOptions); len(errs) != 0 {
 				t.Errorf("unexpected error: %v", errs)
 			}
@@ -257,6 +290,7 @@ func TestValidatePodLogOptions(t *testing.T) {
 
 	errorCase := []struct {
 		name          string
+		enableSplit   bool
 		podLogOptions v1.PodLogOptions
 	}{
 		{
@@ -290,10 +324,17 @@ func TestValidatePodLogOptions(t *testing.T) {
 				SinceSeconds: &sinceSecondsGreaterThan1,
 				SinceTime:    &timestamp,
 			},
+		}, {
+			name:        "Invalid podLogOptions with unknown Stream",
+			enableSplit: true,
+			podLogOptions: v1.PodLogOptions{
+				Stream: &invalidStream,
+			},
 		},
 	}
 	for _, tc := range errorCase {
 		t.Run(tc.name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SplitStdoutAndStderr, tc.enableSplit)()
 			if errs := ValidatePodLogOptions(&tc.podLogOptions); len(errs) == 0 {
 				t.Errorf("expected error")
 			}
