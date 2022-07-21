@@ -38,11 +38,6 @@ import (
 	cadvisorv2 "github.com/google/cadvisor/info/v2"
 	"github.com/google/cadvisor/metrics"
 	"google.golang.org/grpc"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
-	"k8s.io/utils/clock"
-	netutils "k8s.io/utils/net"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -63,8 +58,12 @@ import (
 	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	podresourcesapiv1alpha1 "k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
+	"k8s.io/utils/clock"
+	netutils "k8s.io/utils/net"
+
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/v1/validation"
@@ -75,6 +74,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cri/streaming"
 	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/portforward"
 	remotecommandserver "k8s.io/kubernetes/pkg/kubelet/cri/streaming/remotecommand"
+	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
 	"k8s.io/kubernetes/pkg/kubelet/prober"
 	servermetrics "k8s.io/kubernetes/pkg/kubelet/server/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/server/stats"
@@ -679,9 +679,32 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		response.WriteError(http.StatusInternalServerError, fmt.Errorf("unable to convert %v into http.Flusher, cannot show logs", reflect.TypeOf(response)))
 		return
 	}
-	fw := flushwriter.Wrap(response.ResponseWriter)
+
+	var (
+		stdout io.Writer
+		stderr io.Writer
+		fw     = flushwriter.Wrap(response.ResponseWriter)
+	)
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.SplitStdoutAndStderr) {
+		if logOptions.Stream == nil {
+			allStream := v1.LogStreamTypeAll
+			logOptions.Stream = &allStream
+		}
+		switch *logOptions.Stream {
+		case v1.LogStreamTypeStdout:
+			stdout, stderr = fw, io.Discard
+		case v1.LogStreamTypeStderr:
+			stdout, stderr = io.Discard, fw
+		case v1.LogStreamTypeAll:
+			stdout, stderr = fw, fw
+		}
+	} else {
+		stdout, stderr = fw, fw
+	}
+
 	response.Header().Set("Transfer-Encoding", "chunked")
-	if err := s.host.GetKubeletContainerLogs(ctx, kubecontainer.GetPodFullName(pod), containerName, logOptions, fw, fw); err != nil {
+	if err := s.host.GetKubeletContainerLogs(ctx, kubecontainer.GetPodFullName(pod), containerName, logOptions, stdout, stderr); err != nil {
 		response.WriteError(http.StatusBadRequest, err)
 		return
 	}

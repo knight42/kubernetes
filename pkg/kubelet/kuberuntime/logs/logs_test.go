@@ -19,18 +19,24 @@ package logs
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
-	apitesting "k8s.io/cri-api/pkg/apis/testing"
-	"k8s.io/utils/pointer"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-
-	"k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	apitesting "k8s.io/cri-api/pkg/apis/testing"
+	"k8s.io/utils/pointer"
+
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func TestLogOptions(t *testing.T) {
@@ -46,23 +52,23 @@ func TestLogOptions(t *testing.T) {
 	}{
 		{ // empty options
 			apiOpts: &v1.PodLogOptions{},
-			expect:  &LogOptions{tail: -1, bytes: -1},
+			expect:  &LogOptions{tail: -1, bytes: -1, stream: runtimeapi.LogStreamType(v1.LogStreamTypeAll)},
 		},
 		{ // test tail lines
 			apiOpts: &v1.PodLogOptions{TailLines: &line},
-			expect:  &LogOptions{tail: line, bytes: -1},
+			expect:  &LogOptions{tail: line, bytes: -1, stream: runtimeapi.LogStreamType(v1.LogStreamTypeAll)},
 		},
 		{ // test limit bytes
 			apiOpts: &v1.PodLogOptions{LimitBytes: &bytes},
-			expect:  &LogOptions{tail: -1, bytes: bytes},
+			expect:  &LogOptions{tail: -1, bytes: bytes, stream: runtimeapi.LogStreamType(v1.LogStreamTypeAll)},
 		},
 		{ // test since timestamp
 			apiOpts: &v1.PodLogOptions{SinceTime: &timestamp},
-			expect:  &LogOptions{tail: -1, bytes: -1, since: timestamp.Time},
+			expect:  &LogOptions{tail: -1, bytes: -1, since: timestamp.Time, stream: runtimeapi.LogStreamType(v1.LogStreamTypeAll)},
 		},
 		{ // test since seconds
 			apiOpts: &v1.PodLogOptions{SinceSeconds: &sinceseconds},
-			expect:  &LogOptions{tail: -1, bytes: -1, since: timestamp.Add(-10 * time.Second)},
+			expect:  &LogOptions{tail: -1, bytes: -1, since: timestamp.Add(-10 * time.Second), stream: runtimeapi.LogStreamType(v1.LogStreamTypeAll)},
 		},
 	} {
 		t.Logf("TestCase #%d: %+v", c, test)
@@ -72,7 +78,7 @@ func TestLogOptions(t *testing.T) {
 }
 
 func TestReadLogs(t *testing.T) {
-	file, err := ioutil.TempFile("", "TestFollowLogs")
+	file, err := os.CreateTemp("", "TestFollowLogs")
 	if err != nil {
 		t.Fatalf("unable to create temp file")
 	}
@@ -80,79 +86,86 @@ func TestReadLogs(t *testing.T) {
 	file.WriteString(`{"log":"line1\n","stream":"stdout","time":"2020-09-27T11:18:01.00000000Z"}` + "\n")
 	file.WriteString(`{"log":"line2\n","stream":"stdout","time":"2020-09-27T11:18:02.00000000Z"}` + "\n")
 	file.WriteString(`{"log":"line3\n","stream":"stdout","time":"2020-09-27T11:18:03.00000000Z"}` + "\n")
+	file.WriteString(`{"log":"line4\n","stream":"stderr","time":"2020-09-27T11:18:04.00000000Z"}` + "\n")
+	file.WriteString(`{"log":"line5\n","stream":"stdout","time":"2020-09-27T11:18:05.00000000Z"}` + "\n")
+	file.WriteString(`{"log":"line6\n","stream":"stderr","time":"2020-09-27T11:18:06.00000000Z"}` + "\n")
 
 	testCases := []struct {
-		name          string
-		podLogOptions v1.PodLogOptions
-		expected      string
+		name           string
+		podLogOptions  v1.PodLogOptions
+		expectedStdout string
+		expectedStderr string
 	}{
 		{
-			name:          "default pod log options should output all lines",
-			podLogOptions: v1.PodLogOptions{},
-			expected:      "line1\nline2\nline3\n",
+			name:           "default pod log options should output all lines",
+			podLogOptions:  v1.PodLogOptions{},
+			expectedStdout: "line1\nline2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 		{
 			name: "using TailLines 2 should output last 2 lines",
 			podLogOptions: v1.PodLogOptions{
 				TailLines: pointer.Int64Ptr(2),
 			},
-			expected: "line2\nline3\n",
+			expectedStdout: "line5\n",
+			expectedStderr: "line6\n",
 		},
 		{
-			name: "using TailLines 4 should output all lines when the log has less than 4 lines",
+			name: "using TailLines 8 should output all lines when the log has less than 8 lines",
 			podLogOptions: v1.PodLogOptions{
-				TailLines: pointer.Int64Ptr(4),
+				TailLines: pointer.Int64Ptr(8),
 			},
-			expected: "line1\nline2\nline3\n",
+			expectedStdout: "line1\nline2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 		{
 			name: "using TailLines 0 should output nothing",
 			podLogOptions: v1.PodLogOptions{
 				TailLines: pointer.Int64Ptr(0),
 			},
-			expected: "",
 		},
 		{
 			name: "using LimitBytes 9 should output first 9 bytes",
 			podLogOptions: v1.PodLogOptions{
 				LimitBytes: pointer.Int64Ptr(9),
 			},
-			expected: "line1\nlin",
+			expectedStdout: "line1\nlin",
 		},
 		{
 			name: "using LimitBytes 100 should output all bytes when the log has less than 100 bytes",
 			podLogOptions: v1.PodLogOptions{
 				LimitBytes: pointer.Int64Ptr(100),
 			},
-			expected: "line1\nline2\nline3\n",
+			expectedStdout: "line1\nline2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 		{
 			name: "using LimitBytes 0 should output nothing",
 			podLogOptions: v1.PodLogOptions{
 				LimitBytes: pointer.Int64Ptr(0),
 			},
-			expected: "",
 		},
 		{
 			name: "using SinceTime should output lines with a time on or after the specified time",
 			podLogOptions: v1.PodLogOptions{
 				SinceTime: &metav1.Time{Time: time.Date(2020, time.Month(9), 27, 11, 18, 02, 0, time.UTC)},
 			},
-			expected: "line2\nline3\n",
+			expectedStdout: "line2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 		{
 			name: "using SinceTime now should output nothing",
 			podLogOptions: v1.PodLogOptions{
 				SinceTime: &metav1.Time{Time: time.Now()},
 			},
-			expected: "",
 		},
 		{
 			name: "using follow should output all log lines",
 			podLogOptions: v1.PodLogOptions{
 				Follow: true,
 			},
-			expected: "line1\nline2\nline3\n",
+			expectedStdout: "line1\nline2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 		{
 			name: "using follow combined with TailLines 2 should output the last 2 lines",
@@ -160,7 +173,8 @@ func TestReadLogs(t *testing.T) {
 				Follow:    true,
 				TailLines: pointer.Int64Ptr(2),
 			},
-			expected: "line2\nline3\n",
+			expectedStdout: "line5\n",
+			expectedStderr: "line6\n",
 		},
 		{
 			name: "using follow combined with SinceTime should output lines with a time on or after the specified time",
@@ -168,41 +182,203 @@ func TestReadLogs(t *testing.T) {
 				Follow:    true,
 				SinceTime: &metav1.Time{Time: time.Date(2020, time.Month(9), 27, 11, 18, 02, 0, time.UTC)},
 			},
-			expected: "line2\nline3\n",
+			expectedStdout: "line2\nline3\nline5\n",
+			expectedStderr: "line4\nline6\n",
 		},
 	}
 	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			containerID := "fake-container-id"
-			fakeRuntimeService := &apitesting.FakeRuntimeService{
-				Containers: map[string]*apitesting.FakeContainer{
-					containerID: {
-						ContainerStatus: runtimeapi.ContainerStatus{
-							State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+		for _, enableSplit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s (enableSplit=%v)", tc.name, enableSplit), func(t *testing.T) {
+				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SplitStdoutAndStderr, enableSplit)()
+				r := require.New(t)
+				containerID := "fake-container-id"
+				fakeRuntimeService := &apitesting.FakeRuntimeService{
+					Containers: map[string]*apitesting.FakeContainer{
+						containerID: {
+							ContainerStatus: runtimeapi.ContainerStatus{
+								State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+							},
 						},
 					},
-				},
-			}
-			// If follow is specified, mark the container as exited or else ReadLogs will run indefinitely
-			if tc.podLogOptions.Follow {
-				fakeRuntimeService.Containers[containerID].State = runtimeapi.ContainerState_CONTAINER_EXITED
-			}
+				}
+				// If follow is specified, mark the container as exited or else ReadLogs will run indefinitely
+				if tc.podLogOptions.Follow {
+					fakeRuntimeService.Containers[containerID].State = runtimeapi.ContainerState_CONTAINER_EXITED
+				}
 
-			opts := NewLogOptions(&tc.podLogOptions, time.Now())
-			stdoutBuf := bytes.NewBuffer(nil)
-			stderrBuf := bytes.NewBuffer(nil)
-			err = ReadLogs(context.TODO(), file.Name(), containerID, opts, fakeRuntimeService, stdoutBuf, stderrBuf)
+				opts := NewLogOptions(&tc.podLogOptions, time.Now())
+				stdoutBuf := bytes.NewBuffer(nil)
+				stderrBuf := bytes.NewBuffer(nil)
+				err = ReadLogs(context.TODO(), file.Name(), containerID, opts, fakeRuntimeService, stdoutBuf, stderrBuf)
+				r.NoError(err)
 
-			if err != nil {
-				t.Fatalf(err.Error())
-			}
-			if stderrBuf.Len() > 0 {
-				t.Fatalf("Stderr: %v", stderrBuf.String())
-			}
-			if actual := stdoutBuf.String(); tc.expected != actual {
-				t.Fatalf("Actual output does not match expected.\nActual:  %v\nExpected: %v\n", actual, tc.expected)
-			}
-		})
+				r.Equal(tc.expectedStdout, stdoutBuf.String(), "Actual stdout does not match expected.")
+				r.Equal(tc.expectedStderr, stderrBuf.String(), "Actual stderr does not match expected.")
+			})
+		}
+	}
+}
+
+func TestReadLogsFromSpecificStream(t *testing.T) {
+	stdoutStream := v1.LogStreamTypeStdout
+	stderrStream := v1.LogStreamTypeStderr
+	allStream := v1.LogStreamTypeAll
+	_, _ = stderrStream, allStream
+
+	dockerLogs, err := os.CreateTemp("", "docker-logs-*")
+	require.NoError(t, err, "create temp file")
+	criLogs, err := os.CreateTemp("", "cri-logs-*")
+	require.NoError(t, err, "create temp file")
+	defer os.Remove(dockerLogs.Name())
+	defer os.Remove(criLogs.Name())
+
+	dockerLogs.WriteString(`{"log":"line1\n","stream":"stdout","time":"2020-09-27T11:18:01.00000000Z"}
+{"log":"line2\n","stream":"stdout","time":"2020-09-27T11:18:02.00000000Z"}
+{"log":"line3\n","stream":"stderr","time":"2020-09-27T11:18:03.00000000Z"}
+{"log":"line4\n","stream":"stdout","time":"2020-09-27T11:18:04.00000000Z"}
+{"log":"line5\n","stream":"stderr","time":"2020-09-27T11:18:05.00000000Z"}
+`)
+	criLogs.WriteString(`2020-09-27T11:18:01.00000000Z stdout F line1
+2020-09-27T11:18:02.00000000Z stdout F line2
+2020-09-27T11:18:03.00000000Z stderr F line3
+2020-09-27T11:18:04.00000000Z stdout F line4
+2020-09-27T11:18:05.00000000Z stderr F line5
+`)
+
+	testCases := map[string]struct {
+		disableSplit   bool
+		podLogOptions  v1.PodLogOptions
+		expectedStdout string
+		expectedStderr string
+	}{
+		"should output all lines if feature gate is disabled": {
+			disableSplit: true,
+			podLogOptions: v1.PodLogOptions{
+				Stream: &stdoutStream,
+			},
+			expectedStdout: "line1\nline2\nline4\n",
+			expectedStderr: "line3\nline5\n",
+		},
+		"using Stream all should output all lines": {
+			podLogOptions: v1.PodLogOptions{
+				Stream: &allStream,
+			},
+			expectedStdout: "line1\nline2\nline4\n",
+			expectedStderr: "line3\nline5\n",
+		},
+		"using Stream stdout combined with TailLines 2 should output the last 2 lines from stdout": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stdoutStream,
+				TailLines: pointer.Int64Ptr(2),
+			},
+			expectedStdout: "line2\nline4\n",
+		},
+		"using Stream stdout combined with TailLines 8 should output all lines from stdout": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stdoutStream,
+				TailLines: pointer.Int64Ptr(8),
+			},
+			expectedStdout: "line1\nline2\nline4\n",
+		},
+		"using Stream stdout combined with TailLines 0 should output nothing": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stdoutStream,
+				TailLines: pointer.Int64Ptr(0),
+			},
+		},
+		"using Stream stderr combined with TailLines 1 should output last 1 line from stderr": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stderrStream,
+				TailLines: pointer.Int64Ptr(1),
+			},
+			expectedStderr: "line5\n",
+		},
+		"using Stream stderr combined with TailLines 0 should output nothing": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stderrStream,
+				TailLines: pointer.Int64Ptr(0),
+			},
+		},
+		"using Stream stderr and LimitBytes 9 should output first 9 bytes": {
+			podLogOptions: v1.PodLogOptions{
+				LimitBytes: pointer.Int64Ptr(9),
+				Stream:     &stderrStream,
+			},
+			expectedStderr: "line3\nlin",
+		},
+		"using Stream stderr and LimitBytes 100 should output all bytes": {
+			podLogOptions: v1.PodLogOptions{
+				LimitBytes: pointer.Int64Ptr(100),
+				Stream:     &stderrStream,
+			},
+			expectedStderr: "line3\nline5\n",
+		},
+		"using Stream stderr and LimitBytes 0 should output nothing": {
+			podLogOptions: v1.PodLogOptions{
+				LimitBytes: pointer.Int64Ptr(0),
+				Stream:     &stderrStream,
+			},
+		},
+		"using Stream stdout and SinceTime should output lines with a time on or after the specified time": {
+			podLogOptions: v1.PodLogOptions{
+				SinceTime: &metav1.Time{Time: time.Date(2020, time.Month(9), 27, 11, 18, 02, 0, time.UTC)},
+				Stream:    &stdoutStream,
+			},
+			expectedStdout: "line2\nline4\n",
+		},
+		"using Stream stdout and SinceTime now should output nothing": {
+			podLogOptions: v1.PodLogOptions{
+				SinceTime: &metav1.Time{Time: time.Now()},
+				Stream:    &stdoutStream,
+			},
+		},
+		"using Stream stdout, TailLines 2 and Follow should output last 2 lines": {
+			podLogOptions: v1.PodLogOptions{
+				Stream:    &stdoutStream,
+				Follow:    true,
+				TailLines: pointer.Int64Ptr(2),
+			},
+			expectedStdout: "line2\nline4\n",
+		},
+		"using Stream stdout, SinceTime and Follow should output lines with a time on or after the specified time": {
+			podLogOptions: v1.PodLogOptions{
+				SinceTime: &metav1.Time{Time: time.Date(2020, time.Month(9), 27, 11, 18, 02, 0, time.UTC)},
+				Stream:    &stdoutStream,
+				Follow:    true,
+			},
+			expectedStdout: "line2\nline4\n",
+		},
+	}
+	for name, tc := range testCases {
+		for _, logFile := range []*os.File{dockerLogs, criLogs} {
+			logFormat := strings.SplitN(filepath.Base(logFile.Name()), "-", 2)[0]
+			t.Run(fmt.Sprintf("%s-%s", name, logFormat), func(t *testing.T) {
+				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SplitStdoutAndStderr, !tc.disableSplit)()
+
+				r := require.New(t)
+				containerID := "fake-container-id"
+				fakeRuntimeService := &apitesting.FakeRuntimeService{
+					Containers: map[string]*apitesting.FakeContainer{
+						containerID: {
+							ContainerStatus: runtimeapi.ContainerStatus{
+								State: runtimeapi.ContainerState_CONTAINER_RUNNING,
+							},
+						},
+					},
+				}
+				// If follow is specified, mark the container as exited or else ReadLogs will run indefinitely
+				if tc.podLogOptions.Follow {
+					fakeRuntimeService.Containers[containerID].State = runtimeapi.ContainerState_CONTAINER_EXITED
+				}
+				opts := NewLogOptions(&tc.podLogOptions, time.Now())
+				stdoutBuf := bytes.NewBuffer(nil)
+				stderrBuf := bytes.NewBuffer(nil)
+				err = ReadLogs(context.TODO(), logFile.Name(), containerID, opts, fakeRuntimeService, stdoutBuf, stderrBuf)
+				r.NoError(err)
+				r.Equal(tc.expectedStdout, stdoutBuf.String(), "Actual stdout does not match expected.")
+				r.Equal(tc.expectedStderr, stderrBuf.String(), "Actual stderr does not match expected.")
+			})
+		}
 	}
 }
 
@@ -396,5 +572,37 @@ func TestWriteLogsWithBytesLimit(t *testing.T) {
 		}
 		assert.Equal(t, test.expectStdout, stdoutBuf.String())
 		assert.Equal(t, test.expectStderr, stderrBuf.String())
+	}
+}
+
+func TestExtractStreamFromLog(t *testing.T) {
+	testCases := map[string]struct {
+		log            string
+		expectedStream string
+	}{
+		"cri-stdout": {
+			log:            "2016-10-06T00:17:09.669794202Z stdout P log content 1",
+			expectedStream: "stdout",
+		},
+		"cri-stderr": {
+			log:            "2016-10-06T00:17:09.669794202Z stderr F log content 1",
+			expectedStream: "stderr",
+		},
+		"docker-stdout": {
+			log:            `{"log":"content 1","stream":"stdout","time":"2016-10-20T18:39:20.57606443Z"}`,
+			expectedStream: "stdout",
+		},
+		"docker-stderr": {
+			log:            `{"log":"content 1","stream":"stderr","time":"2016-10-20T18:39:20.57606443Z"}`,
+			expectedStream: "stderr",
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			r := require.New(t)
+			got, err := extractStreamFromLog([]byte(tc.log))
+			r.NoError(err)
+			r.EqualValues(tc.expectedStream, got)
+		})
 	}
 }

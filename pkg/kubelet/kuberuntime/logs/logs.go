@@ -30,11 +30,13 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"k8s.io/klog/v2"
-
 	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
+
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 	"k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util/tail"
@@ -88,6 +90,7 @@ type LogOptions struct {
 	since     time.Time
 	follow    bool
 	timestamp bool
+	stream    runtimeapi.LogStreamType
 }
 
 // NewLogOptions convert the v1.PodLogOptions to CRI internal LogOptions.
@@ -97,6 +100,7 @@ func NewLogOptions(apiOpts *v1.PodLogOptions, now time.Time) *LogOptions {
 		bytes:     -1, // -1 by default which means read all logs.
 		follow:    apiOpts.Follow,
 		timestamp: apiOpts.Timestamps,
+		stream:    runtimeapi.LogStreamType(v1.LogStreamTypeAll), // return combined stdout and stderr by default.
 	}
 	if apiOpts.TailLines != nil {
 		opts.tail = *apiOpts.TailLines
@@ -109,6 +113,12 @@ func NewLogOptions(apiOpts *v1.PodLogOptions, now time.Time) *LogOptions {
 	}
 	if apiOpts.SinceTime != nil && apiOpts.SinceTime.After(opts.since) {
 		opts.since = apiOpts.SinceTime.Time
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.SplitStdoutAndStderr) && apiOpts.Stream != nil {
+		switch *apiOpts.Stream {
+		case v1.LogStreamTypeStdout, v1.LogStreamTypeStderr, v1.LogStreamTypeAll:
+			opts.stream = runtimeapi.LogStreamType(*apiOpts.Stream)
+		}
 	}
 	return opts
 }
@@ -207,10 +217,46 @@ func getParseFunc(log []byte) (parseFunc, error) {
 	return nil, fmt.Errorf("unsupported log format: %q", log)
 }
 
+// extractStreamFromLog parses a single log line and returns the stream type.
+func extractStreamFromLog(log []byte) (runtimeapi.LogStreamType, error) {
+	var stream runtimeapi.LogStreamType
+
+	if bytes.HasPrefix(log, []byte{'{'}) {
+		// Docker JSON log format
+		var obj struct {
+			Stream runtimeapi.LogStreamType `json:"stream"`
+		}
+		err := json.Unmarshal(log, &obj)
+		if err != nil {
+			return "", fmt.Errorf("invalid docker json log format: %w", err)
+		}
+		stream = obj.Stream
+	} else {
+		// CRI log format
+		idx := bytes.IndexByte(log, delimiter[0])
+		if idx < 0 || idx+1 >= len(log) {
+			return "", fmt.Errorf("invalid cri log format")
+		}
+		log = log[idx+1:]
+		idx = bytes.IndexByte(log, delimiter[0])
+		if idx < 0 {
+			return "", fmt.Errorf("stream type is not found")
+		}
+		stream = runtimeapi.LogStreamType(log[:idx])
+	}
+
+	switch stream {
+	case runtimeapi.Stderr, runtimeapi.Stdout:
+		return stream, nil
+	}
+	return "", fmt.Errorf("unexpected stream type %q", stream)
+}
+
 // logWriter controls the writing into the stream based on the log options.
 type logWriter struct {
 	stdout io.Writer
 	stderr io.Writer
+	stream runtimeapi.LogStreamType
 	opts   *LogOptions
 	remain int64
 }
@@ -227,6 +273,7 @@ func newLogWriter(stdout io.Writer, stderr io.Writer, opts *LogOptions) *logWrit
 		stderr: stderr,
 		opts:   opts,
 		remain: math.MaxInt64, // initialize it as infinity
+		stream: opts.stream,
 	}
 	if opts.bytes >= 0 {
 		w.remain = opts.bytes
@@ -236,10 +283,15 @@ func newLogWriter(stdout io.Writer, stderr io.Writer, opts *LogOptions) *logWrit
 
 // writeLogs writes logs into stdout, stderr.
 func (w *logWriter) write(msg *logMessage) error {
-	if msg.timestamp.Before(w.opts.since) {
-		// Skip the line because it's older than since
+	switch {
+	case msg.timestamp.Before(w.opts.since):
+		return nil
+	case utilfeature.DefaultFeatureGate.Enabled(features.SplitStdoutAndStderr) &&
+		msg.stream != w.stream &&
+		(w.stream == runtimeapi.Stderr || w.stream == runtimeapi.Stdout):
 		return nil
 	}
+
 	line := msg.log
 	if w.opts.timestamp {
 		prefix := append([]byte(msg.timestamp.Format(timeFormatOut)), delimiter[0])
@@ -295,26 +347,86 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 	}
 	defer f.Close()
 
-	// Search start point based on tail line.
-	start, err := tail.FindTailLineStartIndex(f, opts.tail)
-	if err != nil {
-		return fmt.Errorf("failed to tail %d lines of log file %q: %v", opts.tail, path, err)
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek %d in log file %q: %v", start, path, err)
+	writer := newLogWriter(stdout, stderr, opts)
+	msg := &logMessage{}
+	var parse parseFunc
+
+	tailLines := opts.tail
+	if utilfeature.DefaultFeatureGate.Enabled(features.SplitStdoutAndStderr) &&
+		(opts.stream == runtimeapi.Stdout || opts.stream == runtimeapi.Stderr) &&
+		tailLines > 0 {
+		// If both `stream` and `tailLines` are set, we iterate the log file from the beginning
+		// until we have `tailLines` lines that matches the given `stream`.
+		filterResult, err := filterLogByStream(f, opts.tail, opts.stream)
+		if err != nil {
+			return err
+		}
+		buf := make([]byte, filterResult.maxLogLength)
+		err = filterResult.logIndex.VisitAll(func(item indexItem) error {
+			n, err := f.ReadAt(buf[:item.length], item.offset)
+			if err != nil {
+				return fmt.Errorf("failed to read log file %q: %w", path, err)
+			}
+
+			l := buf[:n]
+			if parse == nil {
+				// Initialize the log parsing function.
+				parse, err = getParseFunc(l)
+				if err != nil {
+					return fmt.Errorf("failed to get parse function: %v", err)
+				}
+			}
+			msg.reset()
+			if err := parse(l, msg); err != nil {
+				klog.ErrorS(err, "Failed when parsing line in log file", "path", path, "line", l)
+				return nil
+			}
+			// Write the log line into the stream.
+			if err := writer.write(msg); err != nil {
+				if err == errMaximumWrite {
+					klog.V(2).InfoS("Finished parsing log file, hit bytes limit", "path", path, "limit", opts.bytes)
+				} else {
+					klog.ErrorS(err, "Failed when writing line to log file", "path", path, "line", msg)
+				}
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			if err == errMaximumWrite {
+				return nil
+			}
+			return err
+		}
+
+		_, err = f.Seek(filterResult.processedBytes, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek %d in log file %q: %v", filterResult.processedBytes, path, err)
+		}
+
+		// subtract the number of written lines
+		tailLines = tailLines - int64(filterResult.logIndex.Len())
+	} else {
+		// Search start point based on tail line.
+		start, err := tail.FindTailLineStartIndex(f, opts.tail)
+		if err != nil {
+			return fmt.Errorf("failed to tail %d lines of log file %q: %v", opts.tail, path, err)
+		}
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek %d in log file %q: %v", start, path, err)
+		}
 	}
 
-	limitedMode := (opts.tail >= 0) && (!opts.follow)
+	limitedMode := (tailLines >= 0) && (!opts.follow)
 	limitedNum := opts.tail
 	// Start parsing the logs.
 	r := bufio.NewReader(f)
 	// Do not create watcher here because it is not needed if `Follow` is false.
 	var watcher *fsnotify.Watcher
-	var parse parseFunc
 	var stop bool
 	found := true
-	writer := newLogWriter(stdout, stderr, opts)
-	msg := &logMessage{}
+
 	for {
 		if stop || (limitedMode && limitedNum == 0) {
 			klog.V(2).InfoS("Finished parsing log file", "path", path)
@@ -408,7 +520,6 @@ func ReadLogs(ctx context.Context, path, containerID string, opts *LogOptions, r
 		if limitedMode {
 			limitedNum--
 		}
-
 	}
 }
 
